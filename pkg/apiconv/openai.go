@@ -14,8 +14,29 @@ import (
 	"github.com/n0madic/go-gemini-web2api/pkg/gemini"
 )
 
-// toolCallRe matches a ```tool_call ... ``` block emitted by the model.
-var toolCallRe = regexp.MustCompile("(?s)```tool_call\\s*\\n(.*?)\\n```")
+// fenceRe matches a fenced code block emitted by the model. The model is asked to
+// wrap tool calls in ```tool_call ... ```, but in practice it varies the fence
+// language (tool_code, json, or none), omits the closing fence, or puts the
+// closing fence on the same line as the body. This pattern is deliberately
+// lenient: group 1 is the (optional) language tag, group 2 is the block body, and
+// the closing fence is optional (falls back to end-of-string for an unterminated
+// block). Whether a matched block is actually a tool call is decided by parsing
+// its body, not by the tag, so non-tool code blocks are left untouched.
+var fenceRe = regexp.MustCompile("(?s)```[ \\t]*([\\w-]*)[ \\t]*\\r?\\n(.*?)(?:```|$)")
+
+// toolFenceTags are language tags that signal tool-call intent. A block carrying
+// one of these is treated as a tool call whenever its body names a tool, even if
+// the JSON omits an "arguments" key. Blocks with any other tag (or none) must also
+// carry an "arguments" key to be accepted, which avoids misreading an ordinary
+// ```json answer that merely happens to contain a "name" field.
+var toolFenceTags = map[string]bool{
+	"tool_call":     true,
+	"tool_code":     true,
+	"tool_use":      true,
+	"tool":          true,
+	"function":      true,
+	"function_call": true,
+}
 
 // ─── Incoming request types (OpenAI Chat Completions) ────────────────────────
 
@@ -57,7 +78,11 @@ type ToolFunction struct {
 }
 
 // ToolCall is an assistant tool invocation, used both inbound and outbound.
+// Index is set only on streaming chat-completion deltas, where the OpenAI schema
+// requires each tool_calls entry to carry its position so clients can assemble
+// calls across chunks; it is omitted everywhere else.
 type ToolCall struct {
+	Index    *int             `json:"index,omitempty"`
 	ID       string           `json:"id"`
 	Type     string           `json:"type"`
 	Function ToolCallFunction `json:"function"`
@@ -279,33 +304,119 @@ func messagesToPrompt(messages []Message, tools []Tool, tc toolChoiceMode) strin
 	return joinNonEmpty(parts, "\n\n")
 }
 
-// ParseToolCalls extracts ```tool_call``` blocks, returning the cleaned text and
-// the parsed tool calls.
+// ParseToolCalls extracts tool calls from the model output, returning the cleaned
+// text (tool-call blocks removed) and the parsed calls. It scans fenced blocks and
+// accepts those whose body is JSON naming a tool; code blocks that are not tool
+// calls are preserved in the cleaned text. If no fenced tool call is found and the
+// whole reply is a bare JSON tool call (no fence at all), that is parsed too.
 func ParseToolCalls(text string) (string, []ToolCall) {
 	var calls []ToolCall
-	for _, m := range toolCallRe.FindAllStringSubmatch(text, -1) {
-		var data struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
+	var clean strings.Builder
+	last := 0
+
+	for _, loc := range fenceRe.FindAllStringSubmatchIndex(text, -1) {
+		// loc layout: [matchStart, matchEnd, tagStart, tagEnd, bodyStart, bodyEnd].
+		tag := strings.ToLower(text[loc[2]:loc[3]])
+		body := strings.TrimSpace(text[loc[4]:loc[5]])
+		blockCalls := decodeToolCalls(body, toolFenceTags[tag])
+		if len(blockCalls) == 0 {
+			continue // not a tool call: leave the block where it is
 		}
-		if err := json.Unmarshal([]byte(strings.TrimSpace(m[1])), &data); err != nil {
-			continue
+		clean.WriteString(text[last:loc[0]])
+		last = loc[1]
+		calls = append(calls, blockCalls...)
+	}
+	clean.WriteString(text[last:])
+	result := strings.TrimSpace(clean.String())
+
+	if len(calls) == 0 {
+		// Bare-JSON fallback: the entire reply is a tool call with no code fence.
+		if bare := toolCallsFromJSON([]byte(result), false); len(bare) > 0 {
+			return "", bare
 		}
-		if data.Name == "" {
-			continue
+	}
+	return result, calls
+}
+
+// decodeToolCalls reads one or more JSON values from a fenced block body and turns
+// each that names a tool into a ToolCall. tagIntent reports whether the fence tag
+// already signalled tool-call intent (see toolFenceTags).
+func decodeToolCalls(body string, tagIntent bool) []ToolCall {
+	dec := json.NewDecoder(strings.NewReader(body))
+	var out []ToolCall
+	for {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			break
+		}
+		out = append(out, toolCallsFromJSON(raw, tagIntent)...)
+	}
+	return out
+}
+
+// toolCallsFromJSON parses a single JSON value (object or array of objects) into
+// tool calls. An object qualifies when it has a non-empty string "name" and either
+// the fence signalled tool intent (tagIntent) or the object carries an "arguments"
+// key. The whole value must be valid JSON, so trailing prose is rejected.
+func toolCallsFromJSON(raw []byte, tagIntent bool) []ToolCall {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return nil
+	}
+	switch trimmed[0] {
+	case '[':
+		var arr []json.RawMessage
+		if json.Unmarshal([]byte(trimmed), &arr) != nil {
+			return nil
+		}
+		var out []ToolCall
+		for _, e := range arr {
+			out = append(out, toolCallsFromJSON(e, tagIntent)...)
+		}
+		return out
+	case '{':
+		var obj map[string]json.RawMessage
+		if json.Unmarshal([]byte(trimmed), &obj) != nil {
+			return nil
+		}
+		var name string
+		if json.Unmarshal(obj["name"], &name) != nil || name == "" {
+			return nil
+		}
+		argsRaw, hasArgs := obj["arguments"]
+		if !tagIntent && !hasArgs {
+			return nil
 		}
 		args := "{}"
-		if len(data.Arguments) > 0 {
-			args = string(data.Arguments)
+		if hasArgs {
+			args = normalizeToolArgs(argsRaw)
 		}
-		calls = append(calls, ToolCall{
+		return []ToolCall{{
 			ID:       "call_" + hexToken(8),
 			Type:     "function",
-			Function: ToolCallFunction{Name: data.Name, Arguments: args},
-		})
+			Function: ToolCallFunction{Name: name, Arguments: args},
+		}}
+	default:
+		return nil
 	}
-	clean := strings.TrimSpace(toolCallRe.ReplaceAllString(text, ""))
-	return clean, calls
+}
+
+// normalizeToolArgs renders a tool call's arguments as the JSON string the OpenAI
+// schema expects. An object/array/scalar is passed through as its JSON text; a
+// double-encoded JSON string ("{...}") is unwrapped to its inner JSON; null/empty
+// becomes "{}".
+func normalizeToolArgs(raw json.RawMessage) string {
+	t := strings.TrimSpace(string(raw))
+	if t == "" || t == "null" {
+		return "{}"
+	}
+	if t[0] == '"' {
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			return s
+		}
+	}
+	return t
 }
 
 // joinNonEmpty joins only the non-empty parts with sep.

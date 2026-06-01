@@ -95,6 +95,101 @@ func TestParseToolCallsNone(t *testing.T) {
 	}
 }
 
+// TestParseToolCallsVariants covers the real-world formatting variations the model
+// produces. The proxy only instructs the model to emit ```tool_call``` blocks, but
+// it frequently varies the fence tag, drops the closing fence, or emits bare JSON;
+// each of these must still be recognized so the call is not leaked as plain text.
+func TestParseToolCallsVariants(t *testing.T) {
+	const obj = "{\"name\": \"glob\", \"arguments\": {\"pattern\": \"*\"}}"
+	tests := []struct {
+		name      string
+		in        string
+		wantCalls int
+		wantName  string
+		wantClean string // checked only when non-empty
+	}{
+		{"inline_prefix", "List files:```tool_call\n" + obj + "\n```", 1, "glob", "List files:"},
+		{"clean_block", "```tool_call\n" + obj + "\n```", 1, "glob", ""},
+		{"json_fence_with_args", "```json\n" + obj + "\n```", 1, "glob", ""},
+		{"tool_code_fence", "```tool_code\n" + obj + "\n```", 1, "glob", ""},
+		{"no_closing_fence", "```tool_call\n" + obj, 1, "glob", ""},
+		{"closing_same_line", "```tool_call\n" + obj + "```", 1, "glob", ""},
+		{"crlf", "```tool_call\r\n" + obj + "\r\n```", 1, "glob", ""},
+		{"bare_json", obj, 1, "glob", ""},
+		{"tool_code_no_args", "```tool_code\n{\"name\": \"ls\"}\n```", 1, "ls", ""},
+		{"array_two_calls", "```tool_call\n[{\"name\":\"a\",\"arguments\":{}},{\"name\":\"b\",\"arguments\":{}}]\n```", 2, "a", ""},
+		// Negative cases: a plain JSON answer or code block must be left as text.
+		{"json_answer_no_args", "```json\n{\"name\": \"srv\", \"port\": 8080}\n```", 0, "", ""},
+		{"python_block", "```python\nprint('hi')\n```", 0, "", ""},
+		{"bare_name_only", "{\"name\": \"x\"}", 0, "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clean, calls := ParseToolCalls(tt.in)
+			if len(calls) != tt.wantCalls {
+				t.Fatalf("calls = %d, want %d (clean=%q)", len(calls), tt.wantCalls, clean)
+			}
+			if tt.wantName != "" && calls[0].Function.Name != tt.wantName {
+				t.Errorf("name = %q, want %q", calls[0].Function.Name, tt.wantName)
+			}
+			if tt.wantClean != "" && clean != tt.wantClean {
+				t.Errorf("clean = %q, want %q", clean, tt.wantClean)
+			}
+			if tt.wantCalls == 0 && clean != strings.TrimSpace(tt.in) {
+				t.Errorf("non-tool text altered: clean = %q, want %q", clean, strings.TrimSpace(tt.in))
+			}
+			for _, c := range calls {
+				if c.Function.Arguments == "" {
+					t.Errorf("call %q has empty arguments", c.Function.Name)
+				}
+			}
+		})
+	}
+}
+
+// TestChatChunkCompleteToolIndex verifies the streaming tool-call delta carries an
+// "index" (required by the OpenAI streaming schema) while the non-streaming
+// completion omits it.
+func TestChatChunkCompleteToolIndex(t *testing.T) {
+	calls := []ToolCall{
+		{ID: "call_1", Type: "function", Function: ToolCallFunction{Name: "a", Arguments: "{}"}},
+		{ID: "call_2", Type: "function", Function: ToolCallFunction{Name: "b", Arguments: "{}"}},
+	}
+
+	chunk, err := json.Marshal(ChatChunkComplete("id", "model", "", calls))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Each tool call should be stamped with its position (index precedes id).
+	if !strings.Contains(string(chunk), `"index":0,"id":"call_1"`) ||
+		!strings.Contains(string(chunk), `"index":1,"id":"call_2"`) {
+		t.Errorf("streaming delta missing per-call index: %s", chunk)
+	}
+
+	full, err := json.Marshal(ChatCompletion("id", "model", "prompt", "", calls))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The non-streaming tool_calls entries must not carry an index.
+	if strings.Contains(string(full), `"index":0,"id":"call_1"`) {
+		t.Errorf("non-streaming completion should omit tool-call index: %s", full)
+	}
+}
+
+func TestNormalizeToolArgs(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{`{"city":"NYC"}`, `{"city":"NYC"}`},
+		{`"{\"city\":\"NYC\"}"`, `{"city":"NYC"}`}, // double-encoded string
+		{`null`, `{}`},
+		{``, `{}`},
+	}
+	for _, tt := range tests {
+		if got := normalizeToolArgs([]byte(tt.in)); got != tt.want {
+			t.Errorf("normalizeToolArgs(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestRawContentText(t *testing.T) {
 	if got := rawContentText(jsonString("plain")); got != "plain" {
 		t.Errorf("string content = %q, want plain", got)

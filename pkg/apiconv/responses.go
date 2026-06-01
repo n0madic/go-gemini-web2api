@@ -316,10 +316,21 @@ func contentPtr(text string) *string {
 	return &text
 }
 
-// deltaFromMsg builds a streaming delta carrying a full assistant message,
-// used for the single-chunk tool-calling stream response.
+// deltaFromMsg builds a streaming delta carrying a full assistant message, used
+// for the single-chunk tool-calling stream response. It stamps each tool call with
+// its index, which the OpenAI streaming schema requires on tool_calls deltas (the
+// non-streaming message form omits it).
 func deltaFromMsg(msg outMessage) chunkDelta {
-	return chunkDelta{Role: msg.Role, Content: msg.Content, ToolCalls: msg.ToolCalls}
+	var tcs []ToolCall
+	if len(msg.ToolCalls) > 0 {
+		tcs = make([]ToolCall, len(msg.ToolCalls))
+		for i, tc := range msg.ToolCalls {
+			idx := i
+			tc.Index = &idx
+			tcs[i] = tc
+		}
+	}
+	return chunkDelta{Role: msg.Role, Content: msg.Content, ToolCalls: tcs}
 }
 
 // usageFor computes approximate token usage for a prompt/completion pair.
