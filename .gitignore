@@ -1,0 +1,10 @@
+# Build output
+/go-gemini-web2api
+*.exe
+
+# Local config
+.env
+*.txt
+
+# Editor / OS
+.DS_Store
